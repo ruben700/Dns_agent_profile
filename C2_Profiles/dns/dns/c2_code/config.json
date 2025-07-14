@@ -1,0 +1,11 @@
+{
+    "instances": [
+        {
+            "domains": "c2.example.com",
+            "key": "13a6868413d6f20d9ae58dcbb82f136b506c85964dab3c2f303764c6b1f89318",
+            "debug": "true",
+            "msginit": "app",
+            "msgdefault": "dash"
+        }
+    ]
+}

