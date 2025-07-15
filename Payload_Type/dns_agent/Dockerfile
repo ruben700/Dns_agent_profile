@@ -4,9 +4,12 @@ USER root
 WORKDIR /Mythic
 
 # Solo si necesitas mingw por la compilación dentro del contenedor
-RUN apt-get update && \
+RUN sed -i 's|http://deb.debian.org/debian|http://archive.debian.org/debian|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.debian.org/debian-security|http://archive.debian.org/debian-security|g' /etc/apt/sources.list && \
+    apt-get update && \
     apt-get install -y --no-install-recommends mingw-w64 build-essential && \
     rm -rf /var/lib/apt/lists/*
+
 
 COPY main.py           ./
 COPY build.py          ./

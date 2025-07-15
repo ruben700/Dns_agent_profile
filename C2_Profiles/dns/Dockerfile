@@ -1,10 +1,6 @@
 FROM itsafeaturemythic/mythic_python:latest
 
-# Instalar las dependencias necesarias del sistema
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
+
 
 # Instalar librerías Python necesarias
 RUN pip install --no-cache-dir dnslib requests
